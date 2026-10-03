@@ -193,6 +193,47 @@ input[type="color"] { width: 100%; height: 34px; border: 1px solid var(--border-
 }
 .node.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .node.error { border-color: var(--red); }
+/* 规则校验标记（区别于运行时失败的 .error） */
+.node.state-invalid { border-color: var(--red); box-shadow: 0 0 0 1px var(--red); }
+.node.state-warning { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+.node.state-invalid .dot { background: var(--red); }
+.node.state-warning .dot { background: var(--amber); }
+.node-state-badge {
+  font-size: 11px; line-height: 1; width: 15px; height: 15px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center; font-weight: 700;
+}
+.node-state-badge.bad { background: var(--red); color: #fff; }
+.node-state-badge.warn { background: var(--amber); color: #1a1206; }
+.canvas svg path.edge-bad { stroke: var(--red); stroke-dasharray: 5 3; opacity: .9; }
+.canvas svg circle.edge-bad-dot { fill: var(--red); stroke: #fff; stroke-width: 1; }
+.invalid-text { color: var(--red); }
+.warn-text { color: var(--amber); }
+
+/* ---------- 校验横幅（流水线编辑器） ---------- */
+.validation-bar {
+  position: absolute; left: 12px; right: 12px; top: 34px; z-index: 4;
+  border-radius: var(--radius-sm); padding: 8px 12px; font-size: 12px;
+  border: 1px solid var(--border-strong); background: var(--bg-card); max-height: 132px; overflow: auto;
+}
+.validation-bar.ok { border-color: rgba(53,199,120,.5); color: var(--green); }
+.validation-bar.warning { border-color: rgba(245,181,68,.5); }
+.validation-bar.error { border-color: rgba(242,95,92,.6); }
+.validation-bar ul { margin: 6px 0 0; padding-left: 18px; }
+.validation-bar ul.vb-warn { color: var(--amber); }
+.validation-bar.error { color: var(--text); }
+
+/* ---------- 节点问题清单（检查器/历史详情） ---------- */
+.node-issue-list, .compat-issues { margin: 6px 0 8px; padding-left: 18px; font-size: 12px; line-height: 1.7; }
+.compat-box {
+  margin-top: 10px; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--bg-soft);
+}
+.invalid-box {
+  margin-top: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.7;
+  border: 1px solid rgba(242,95,92,.5); border-radius: var(--radius-sm); color: var(--text-dim);
+}
+.invalid-box code { color: var(--red); }
+.opt-invalid { color: var(--red); }
 .node-header { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; }
 .node-header .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
 .node-body { padding: 6px 10px 8px; font-size: 11px; color: var(--text-faint); }

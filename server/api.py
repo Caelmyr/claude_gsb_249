@@ -93,10 +93,32 @@ def _result_view(entry):
 
 
 def _pipeline_view(p):
+    """给前端用的流水线视图。
+
+    valid/errors/warnings/issues 一律按当前规则实时重算（不依赖保存时的快照），
+    这样节点注册表或连线规则演进后，老流水线/历史恢复产物也会立刻暴露不兼容。
+    """
+    report = pipeline_engine.validate_details(p.get("nodes", []))
     return {
         "id": p["id"], "name": p["name"], "nodes": p["nodes"],
         "version": p.get("version", 1), "created_at": p.get("created_at"),
         "updated_at": p.get("updated_at"),
+        "valid": report["valid"], "error_count": len(report["errors"]),
+        "warning_count": len(report["warnings"]),
+        "errors": report["errors"], "warnings": report["warnings"],
+        "issues": report["issues"], "node_status": report["node_status"],
+    }
+
+
+def _compatibility_view(nodes):
+    """历史快照与当前规则的兼容性摘要（供历史页在恢复前/恢复后展示）。"""
+    report = pipeline_engine.validate_details(nodes or [])
+    return {
+        "valid": report["valid"],
+        "error_count": len(report["errors"]),
+        "warning_count": len(report["warnings"]),
+        "errors": report["errors"], "warnings": report["warnings"],
+        "issues": report["issues"], "node_status": report["node_status"],
     }
 
 
@@ -258,14 +280,16 @@ def create_pipeline():
         "version": 1, "versions": [],
         "created_at": now_iso(), "updated_at": now_iso(),
     }
-    errors = pipeline_engine.validate(rec["nodes"])
-    rec["valid"] = not errors
+    report = pipeline_engine.validate_details(rec["nodes"])
+    rec["valid"] = report["valid"]
+    rec["validation"] = {"error_count": len(report["errors"]),
+                         "warning_count": len(report["warnings"])}
     def _upd(doc):
         doc = dict(doc)
         doc[pid] = rec
         return doc
     pipelines_store.update(_upd)
-    return jsonify({**_pipeline_view(rec), "valid": rec["valid"], "errors": errors})
+    return jsonify(_pipeline_view(rec))
 
 
 @bp.get("/pipelines/<pid>")
@@ -276,10 +300,20 @@ def get_pipeline(pid):
     return jsonify(_pipeline_view(p))
 
 
+@bp.post("/pipelines/validate")
+def validate_pipeline():
+    """按当前规则实时校验一份节点（编辑器编辑/恢复预览时调用，不落库）。"""
+    data = request.get_json(silent=True) or {}
+    report = pipeline_engine.validate_details(data.get("nodes", []))
+    return jsonify({"valid": report["valid"], "errors": report["errors"],
+                    "warnings": report["warnings"], "issues": report["issues"],
+                    "node_status": report["node_status"]})
+
+
 @bp.put("/pipelines/<pid>")
 def update_pipeline(pid):
     data = request.get_json(silent=True) or {}
-    errors = pipeline_engine.validate(data.get("nodes", []))
+    report = pipeline_engine.validate_details(data.get("nodes", []))
 
     def _upd(doc):
         doc = dict(doc)
@@ -296,7 +330,9 @@ def update_pipeline(pid):
         p["version"] = _next_version(p)
         p["versions"] = versions[:config.PIPELINE_MAX_VERSIONS]
         p["updated_at"] = now_iso()
-        p["valid"] = not errors
+        p["valid"] = report["valid"]
+        p["validation"] = {"error_count": len(report["errors"]),
+                           "warning_count": len(report["warnings"])}
         doc[pid] = p
         return doc
 
@@ -304,7 +340,7 @@ def update_pipeline(pid):
     p = pipelines_store.read().get(pid)
     if not p:
         return jsonify({"error": "not found"}), 404
-    return jsonify({**_pipeline_view(p), "valid": not errors, "errors": errors})
+    return jsonify(_pipeline_view(p))
 
 
 @bp.delete("/pipelines/<pid>")
@@ -335,6 +371,17 @@ def run_pipeline():
             pipeline_name = p.get("name")
     if image_id is None or nodes is None:
         return jsonify({"error": "缺少 image_id 或 nodes"}), 400
+
+    # 运行前用当前规则校验：旧快照/已保存流水线可能已与当前节点注册表不符，
+    # 直接挡下并返回逐条问题，避免白白执行一次、甚至落一条失败历史。
+    report = pipeline_engine.validate_details(nodes)
+    if not report["valid"]:
+        return jsonify({
+            "error": "流水线未通过当前规则校验，已取消运行：" + "；".join(report["errors"]),
+            "validation": {"valid": False, "errors": report["errors"],
+                           "warnings": report["warnings"], "issues": report["issues"],
+                           "node_status": report["node_status"]},
+        }), 200
 
     res = process_image(image_store, cache, history, image_id, nodes,
                         pipeline_id=pipeline_id, pipeline_name=pipeline_name)
@@ -527,6 +574,14 @@ def create_batch():
     image_ids = data.get("image_ids", [])
     if not nodes or not image_ids:
         return jsonify({"error": "缺少 nodes 或 image_ids"}), 400
+    report = pipeline_engine.validate_details(nodes)
+    if not report["valid"]:
+        return jsonify({
+            "error": "流水线未通过当前规则校验，无法入队：" + "；".join(report["errors"]),
+            "validation": {"valid": False, "errors": report["errors"],
+                           "warnings": report["warnings"], "issues": report["issues"],
+                           "node_status": report["node_status"]},
+        }), 400
     job = batch.enqueue(nodes, image_ids, pipeline_id=pipeline_id, pipeline_name=pipeline_name)
     return jsonify({"job_id": job["id"]})
 
@@ -603,7 +658,12 @@ def delete_preset(pid):
 # ---------------------------------------------------------------------------
 @bp.get("/history")
 def list_history():
-    return jsonify({"history": history.list()})
+    """历史列表。每条附快照与当前规则的兼容性摘要（恢复前即可看出能不能跑）。"""
+    items = []
+    for e in history.list():
+        snap_nodes = (e.get("pipeline_snapshot") or {}).get("nodes", [])
+        items.append({**e, "compatibility": _compatibility_view(snap_nodes)})
+    return jsonify({"history": items})
 
 
 @bp.get("/history/<history_id>")
@@ -611,7 +671,8 @@ def get_history(history_id):
     e = history.get(history_id)
     if not e:
         return jsonify({"error": "not found"}), 404
-    return jsonify(e)
+    snap_nodes = (e.get("pipeline_snapshot") or {}).get("nodes", [])
+    return jsonify({**e, "compatibility": _compatibility_view(snap_nodes)})
 
 
 @bp.delete("/history/<history_id>")
@@ -625,18 +686,28 @@ def delete_history(history_id):
 
 @bp.post("/history/<history_id>/restore")
 def restore_history(history_id):
+    """从历史快照生成一条新流水线。
+
+    不默认快照有效：立刻用当前规则校验，把可运行性与逐条问题（节点/连线）
+    一并返回并存入记录，页面在运行前就能标出坏节点、坏连线。
+    """
     snapshot = history.restore_snapshot(history_id)
     if snapshot is None:
         return jsonify({"error": "not found"}), 404
-    pid = __import__("uuid").uuid4().hex
     e = history.get(history_id)
+    nodes = snapshot.get("nodes", [])
+    pid = __import__("uuid").uuid4().hex
+    report = pipeline_engine.validate_details(nodes)
     rec = {
         "id": pid,
         "name": f"恢复自 {e.get('pipeline_name') or '历史'}",
-        "nodes": snapshot.get("nodes", []),
+        "nodes": nodes,
         "version": 1, "versions": [],
+        "restored_from": history_id,
         "created_at": now_iso(), "updated_at": now_iso(),
-        "valid": True,
+        "valid": report["valid"],
+        "validation": {"error_count": len(report["errors"]),
+                       "warning_count": len(report["warnings"])},
     }
     pipelines_store.update(lambda doc: {**doc, pid: rec})
     return jsonify(_pipeline_view(rec))

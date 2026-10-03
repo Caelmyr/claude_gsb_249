@@ -10,9 +10,11 @@ window.Views.pipeline = (function () {
   let idCounter = 1;
   let nodeEls = {};        // id -> DOM element
   let connecting = null;   // {from, x, y}
+  let report = null;       // 当前规则实时校验报告（来自 /api/pipelines/validate）
+  let autoLoadId = null;   // 挂载后待自动加载的已保存流水线 id
 
   // 参考元素
-  let canvas, svg, paletteEl, inspectorEl, imageSel, runBtn, previewBox;
+  let canvas, svg, paletteEl, inspectorEl, validationBar, imageSel, runBtn, previewBox;
 
   function newId() { return "n" + (idCounter++); }
 
@@ -42,18 +44,32 @@ window.Views.pipeline = (function () {
     });
   }
 
+  function nodeState(id) {
+    return (report && report.node_status && report.node_status[id]) ? report.node_status[id].state : "ok";
+  }
+
+  function nodeTip(id) {
+    const st = report && report.node_status && report.node_status[id];
+    if (!st) return "";
+    return [].concat(st.errors || [], st.warnings || []).map((m) => "• " + m).join("\n");
+  }
+
   function renderNodes() {
     canvas.querySelectorAll(".node").forEach((n) => n.remove());
     nodeEls = {};
     nodes.forEach((n) => {
+      const state = nodeState(n.id);
+      const tip = nodeTip(n.id);
+      const def = C._nodesInfo[n.type];
       const el = C.h(`
-        <div class="node ${sel === n.id ? "selected" : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
+        <div class="node ${sel === n.id ? "selected" : ""} ${state !== "ok" ? "state-" + state : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
           <div class="node-header"><span class="dot"></span>${C.esc(nodeLabel(n.type))}
-            <span style="flex:1"></span><span class="node-x" title="删除">×</span></div>
-          <div class="node-body">${C.esc((C._nodesInfo[n.type] && C._nodesInfo[n.type].desc) || "")}</div>
+            <span style="flex:1"></span>${state === "invalid" ? '<span class="node-state-badge bad" title="校验未通过">!</span>' : state === "warning" ? '<span class="node-state-badge warn" title="有警告">?</span>' : ""}<span class="node-x" title="删除">×</span></div>
+          <div class="node-body">${C.esc(def ? (def.desc || "") : "当前规则中已不存在的节点类型")}</div>
           <div class="port in" data-id="${n.id}" data-port="in"></div>
           <div class="port out" data-id="${n.id}" data-port="out"></div>
         </div>`);
+      if (tip) el.title = tip;
       canvas.appendChild(el);
       nodeEls[n.id] = el;
       bindNode(el, n);
@@ -61,16 +77,32 @@ window.Views.pipeline = (function () {
     redrawEdges();
   }
 
+  function badEdges() {
+    const set = new Set();
+    (report && report.issues || []).forEach((it) => {
+      if (it.scope === "edge" && it.edge && it.edge.length === 2 && it.severity === "error") {
+        set.add(it.edge[0] + "->" + it.edge[1]);
+      }
+    });
+    return set;
+  }
+
   function redrawEdges() {
+    const bad = badEdges();
     const paths = [];
     nodes.forEach((n) => {
       (n.inputs || []).forEach((srcId) => {
+        const isBad = bad.has(srcId + "->" + n.id);
         const a = nodeEls[srcId], b = nodeEls[n.id];
-        if (!a || !b) return;
+        if (!a || !b) {
+          // 连线另一端节点不存在（悬空边）：画不出线，但也要提示
+          if (isBad && b) drawDanglingEdge(b);
+          return;
+        }
         const x1 = a.offsetLeft + NODE_W, y1 = a.offsetTop + HEADER_H / 2;
         const x2 = b.offsetLeft, y2 = b.offsetTop + HEADER_H / 2;
         const dx = Math.max(28, Math.abs(x2 - x1) / 2);
-        paths.push(`<path d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}"/>`);
+        paths.push(`<path class="${isBad ? "edge-bad" : ""}" data-edge="${srcId}-&gt;${n.id}" d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}"/>`);
       });
     });
     svg.innerHTML = paths.join("");
@@ -81,6 +113,13 @@ window.Views.pipeline = (function () {
       const dx = Math.max(28, Math.abs(connecting.x - x1) / 2);
       svg.innerHTML += `<path d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${connecting.x - dx} ${connecting.y}, ${connecting.x} ${connecting.y}" style="stroke-dasharray:4 3"/>`;
     }
+  }
+
+  function drawDanglingEdge(targetEl) {
+    // 起点未知：在目标输入端口外侧画一段红色断连标记
+    const x2 = targetEl.offsetLeft, y2 = targetEl.offsetTop + HEADER_H / 2;
+    svg.insertAdjacentHTML("beforeend",
+      `<circle cx="${x2 - 10}" cy="${y2}" r="5" class="edge-bad-dot"/>`);
   }
 
   // ------------------------------------------------------------------ 交互
@@ -125,6 +164,7 @@ window.Views.pipeline = (function () {
         connecting = null;
         renderNodes();
         select(n.id);
+        scheduleValidate();
       }
     });
   }
@@ -141,6 +181,7 @@ window.Views.pipeline = (function () {
     if (sel === id) sel = null;
     renderNodes();
     renderInspector();
+    scheduleValidate();
   }
 
   function addNode(type, x, y) {
@@ -150,6 +191,59 @@ window.Views.pipeline = (function () {
     renderNodes();
     const last = nodes[nodes.length - 1];
     select(last.id);
+    scheduleValidate();
+  }
+
+  // ------------------------------------------------------------------ 实时校验
+  let validateTimer = null;
+
+  function scheduleValidate() {
+    clearTimeout(validateTimer);
+    validateTimer = setTimeout(refreshValidation, 300);
+  }
+
+  async function refreshValidation() {
+    if (!nodes.length) { report = null; renderValidationBar(); renderNodes(); return; }
+    try {
+      report = await Api.post("/api/pipelines/validate", { nodes: nodes.map(strip) });
+    } catch (e) {
+      report = { valid: false, errors: ["校验请求失败：" + e.message], warnings: [], issues: [], node_status: {} };
+    }
+    renderValidationBar();
+    renderNodes();
+    // 只刷新选中节点旁的问题徽标/清单，不重建参数表单（避免拖滑块时输入焦点抖动）
+    if (sel) {
+      const header = inspectorEl.querySelector(".panel-title");
+      if (header) {
+        const st = nodeState(sel);
+        header.querySelectorAll(".badge").forEach((b) => b.remove());
+        if (st === "invalid") header.insertAdjacentHTML("beforeend", ' <span class="badge red">校验未通过</span>');
+        if (st === "warning") header.insertAdjacentHTML("beforeend", ' <span class="badge amber">有警告</span>');
+      }
+      renderNodeIssueBox(sel);
+    }
+  }
+
+  function renderValidationBar() {
+    const bar = validationBar;
+    if (!bar) return;
+    if (!nodes.length || !report) { bar.hidden = true; return; }
+    const errs = report.errors || [];
+    const warns = report.warnings || [];
+    bar.classList.remove("ok", "error", "warning");
+    if (!errs.length && !warns.length) {
+      bar.classList.add("ok");
+      bar.innerHTML = `✓ 通过当前规则校验，可直接运行`;
+    } else if (errs.length) {
+      bar.classList.add("error");
+      bar.innerHTML = `✗ 校验未通过 · ${errs.length} 个错误${warns.length ? " · " + warns.length + " 个警告" : ""}，此流水线<b>无法运行</b><ul>${
+        errs.map((m) => `<li>${C.esc(m)}</li>`).join("")}</ul>${warns.length ? `<ul class="vb-warn">${warns.map((m) => `<li>${C.esc(m)}</li>`).join("")}</ul>` : ""}`;
+    } else {
+      bar.classList.add("warning");
+      bar.innerHTML = `? ${warns.length} 个警告（可运行，但参数与当前规则有偏差）<ul class="vb-warn">${
+        warns.map((m) => `<li>${C.esc(m)}</li>`).join("")}</ul>`;
+    }
+    bar.hidden = false;
   }
 
   // ------------------------------------------------------------------ 检查器
@@ -158,26 +252,52 @@ window.Views.pipeline = (function () {
     let paramHTML = `<div class="empty">未选择节点<br><span style="font-size:12px">从左侧拖入节点，或点击已有节点编辑参数</span></div>`;
     if (node) {
       const def = C._nodesInfo[node.type];
-      const form = C.schemaForm(def.schema, node.params);
-      paramHTML = `
-        <div class="panel-title">${C.esc(nodeLabel(node.type))} <span class="dim">#${node.id}</span></div>
-        <div class="param-grid">${form.html}</div>
-        <div class="toolbar" style="margin-top:10px">
-          <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
-          <button class="btn btn-sm" id="insp-clear">清空全部</button>
-        </div>`;
-      // 延迟绑定表单
-      setTimeout(() => {
-        const box = inspectorEl.querySelector(".param-grid");
-        if (box) {
-          form.bind(box, (vals) => { node.params = vals; });
-        }
-        inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
-        inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); };
-      }, 0);
+      if (!def) {
+        paramHTML = `
+          <div class="panel-title"><span class="invalid-text">未知节点类型</span> <span class="dim">#${C.esc(node.id)}</span></div>
+          <div class="invalid-box">类型 <code>${C.esc(node.type)}</code> 在当前节点规则中已不存在（可能来自旧版本快照）。<br>请删除该节点并替换为现有类型，否则流水线无法运行。</div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
+            <button class="btn btn-sm" id="insp-clear">清空全部</button>
+          </div>`;
+        setTimeout(() => {
+          inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
+          inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); scheduleValidate(); };
+        }, 0);
+      } else {
+        const form = C.schemaForm(def.schema, node.params);
+        paramHTML = `
+          <div class="panel-title">${C.esc(nodeLabel(node.type))} <span class="dim">#${node.id}</span>${nodeState(node.id) === "invalid" ? ' <span class="badge red">校验未通过</span>' : nodeState(node.id) === "warning" ? ' <span class="badge amber">有警告</span>' : ""}</div>
+          <div id="insp-node-issues"></div>
+          <div class="param-grid">${form.html}</div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
+            <button class="btn btn-sm" id="insp-clear">清空全部</button>
+          </div>`;
+        // 延迟绑定表单
+        setTimeout(() => {
+          const box = inspectorEl.querySelector(".param-grid");
+          if (box) {
+            form.bind(box, (vals) => { node.params = vals; scheduleValidate(); });
+          }
+          renderNodeIssueBox(node.id);
+          inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
+          inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); scheduleValidate(); };
+        }, 0);
+      }
     }
     inspectorEl.querySelector("#insp-node").innerHTML = paramHTML;
     renderRunSection();
+  }
+
+  function renderNodeIssueBox(id) {
+    const st = report && report.node_status && report.node_status[id];
+    const box = inspectorEl.querySelector("#insp-node-issues");
+    if (!box || !st) return;
+    const rows = []
+      .concat((st.errors || []).map((m) => `<li class="invalid-text">${C.esc(m)}</li>`))
+      .concat((st.warnings || []).map((m) => `<li class="warn-text">${C.esc(m)}</li>`));
+    box.innerHTML = rows.length ? `<ul class="node-issue-list">${rows.join("")}</ul>` : "";
   }
 
   function renderRunSection() {
@@ -213,17 +333,38 @@ window.Views.pipeline = (function () {
     const sel = inspectorEl.querySelector("#insp-load");
     const ps = await C.fetchPipelines();
     sel.innerHTML = `<option value="">— 选择流水线 —</option>` +
-      ps.map((p) => `<option value="${p.id}">${C.esc(p.name)}</option>`).join("");
+      ps.map((p) => {
+        const tag = p.valid === false ? "（不兼容，不可运行）"
+          : (p.warning_count ? "（" + p.warning_count + " 警告）" : "");
+        return `<option value="${p.id}">${C.esc(p.name)}${tag}</option>`;
+      }).join("");
   }
 
   async function runPipeline() {
     const imageId = inspectorEl.querySelector("#insp-image").value;
     if (!imageId) { C.toast("请先选择输入图像", "error"); return; }
     if (!nodes.length) { C.toast("流水线为空，请先添加节点", "error"); return; }
+    if (report && !report.valid) {
+      const msg = (report.errors || []).slice(0, 3).join("\n");
+      if (!confirm("流水线未通过当前规则校验，运行必然失败：\n\n" + msg +
+        (report.errors.length > 3 ? `\n…等 ${report.errors.length} 个错误` : "") +
+        "\n\n仍要尝试运行吗？")) return;
+    } else if (report && (report.warnings || []).length) {
+      if (!confirm("流水线存在 " + report.warnings.length + " 个警告，可运行但结果可能与预期不符。仍要运行吗？")) return;
+    }
     const preview = inspectorEl.querySelector("#insp-preview");
     preview.innerHTML = `<div class="loading">运行中…</div>`;
     try {
       const r = await Api.post("/api/run", { image_id: imageId, nodes: nodes.map(strip), pipeline_name: "临时流水线" });
+      if (r.validation && !r.validation.valid) {
+        preview.innerHTML = `<div class="empty">流水线未通过校验，已取消运行。<br><span class="dim">请按上方红色提示修复节点/连线后再试。</span></div>`;
+        C.toast("校验未通过，未执行运行", "error");
+        report = r.validation;
+        renderValidationBar();
+        renderNodes();
+        renderInspector();
+        return;
+      }
       preview.innerHTML = `
         <img src="${r.file_url}?t=${Date.now()}">
         <div class="caption">${r.cache_hit ? "缓存命中" : "已计算"} · ${(r.meta && r.meta.count != null) ? "对象 " + r.meta.count : ""}</div>`;
@@ -247,32 +388,78 @@ window.Views.pipeline = (function () {
     m.el.querySelector("#sp-cancel").onclick = m.close;
     m.el.querySelector("#sp-ok").onclick = async () => {
       const name = m.el.querySelector("#sp-name").value || "未命名流水线";
-      await Api.post("/api/pipelines", { name, nodes: nodes.map(strip) });
+      const saved = await Api.post("/api/pipelines", { name, nodes: nodes.map(strip) });
       m.close();
-      C.toast("已保存流水线", "success");
+      if (saved.valid === false) {
+        C.toast("已保存，但存在 " + (saved.errors || []).length + " 个校验错误，该流水线当前无法运行", "error");
+      } else if ((saved.warnings || []).length) {
+        C.toast("已保存，有 " + saved.warnings.length + " 个警告（可运行）", "");
+      } else {
+        C.toast("已保存流水线（校验通过）", "success");
+      }
       await C.refreshPipelines();
       loadPipelineOptions();
     };
   }
 
-  async function loadPipeline() {
-    const pid = inspectorEl.querySelector("#insp-load").value;
-    if (!pid) return;
-    const ps = await C.fetchPipelines();
+  async function loadPipelineById(pid) {
+    if (!pid) return false;
+    const ps = await C.refreshPipelines();
     const p = ps.find((x) => x.id === pid);
-    if (!p) return;
+    if (!p) return false;
+    loadPipelineData(p);
+    return true;
+  }
+
+  function loadPipelineData(p) {
+    // 新 id 要避开快照里所有已有/悬空引用（悬空引用可能形如 n9，节点本身已缺失），
+    // 否则重新校验时悬空边可能错误地指向新节点。
+    let maxNum = 0;
+    const usedIds = new Set();
+    (p.nodes || []).forEach((n) => {
+      usedIds.add(n.id);
+      const m = /^n(\d+)$/.exec(n.id || "");
+      if (m) maxNum = Math.max(maxNum, Number(m[1]));
+      (n.inputs || []).forEach((s) => {
+        usedIds.add(s);
+        const mm = /^n(\d+)$/.exec(s || "");
+        if (mm) maxNum = Math.max(maxNum, Number(mm[1]));
+      });
+    });
+    idCounter = maxNum + 1;
     nodes = (p.nodes || []).map((n, i) => ({
       id: newId(), type: n.type, params: n.params, inputs: n.inputs,
       x: n.x != null ? n.x : 20 + (i % 4) * 220, y: n.y != null ? n.y : 20 + Math.floor(i / 4) * 130,
     }));
-    // 修正 inputs 引用（用映射表）
+    // 用映射表重写 inputs 引用；悬空引用（源节点不存在）原样保留为唯一的占位 id，
+    // 让实时校验继续把这条坏连线标红，而不是悄悄抹掉问题。
     const map = {};
     p.nodes.forEach((n, i) => { map[n.id] = nodes[i].id; });
-    nodes.forEach((n) => { n.inputs = (n.inputs || []).map((s) => map[s]).filter(Boolean); });
+    const dangling = new Set();
+    nodes.forEach((n) => {
+      n.inputs = (n.inputs || []).map((s) => {
+        if (map[s]) return map[s];
+        // 悬空：保留一个不与任何真实节点重合的 id
+        let dId = s;
+        while (!dId || usedIds.has(dId) || nodes.some((x) => x.id === dId)) {
+          dId = "missing_" + newId();
+        }
+        usedIds.add(dId);
+        dangling.add(dId);
+        return dId;
+      });
+    });
     sel = null;
     renderNodes();
     renderInspector();
-    C.toast("已加载流水线", "success");
+    refreshValidation();
+  }
+
+  async function loadPipeline() {
+    const pid = inspectorEl.querySelector("#insp-load").value;
+    if (!pid) return;
+    const ok = await loadPipelineById(pid);
+    C.toast(ok ? "已加载流水线" : "加载失败，流水线可能已被删除", ok ? "success" : "error");
   }
 
   // ------------------------------------------------------------------ 挂载
@@ -285,6 +472,7 @@ window.Views.pipeline = (function () {
           </div>
           <div class="canvas-wrap" id="pl-canvas-wrap">
             <div class="canvas-hint">从左侧拖入节点 · 拖「输出」端口到另一节点的「输入」端口连线 · 拖节点头部移动</div>
+            <div id="pl-validation" class="validation-bar" hidden></div>
             <div class="canvas" id="pl-canvas"></div>
           </div>
           <div class="pipeline-inspector" id="pl-inspector">
@@ -294,6 +482,7 @@ window.Views.pipeline = (function () {
 
       paletteEl = el.querySelector("#pl-palette");
       canvas = el.querySelector("#pl-canvas");
+      validationBar = el.querySelector("#pl-validation");
       const wrap = el.querySelector("#pl-canvas-wrap");
       svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       canvas.appendChild(svg);
@@ -309,14 +498,38 @@ window.Views.pipeline = (function () {
       });
 
       C.fetchNodes().then((defs) => {
-        C._nodesInfo = {};
+        C._nodesInfo = C._nodesInfo || {};
         defs.forEach((d) => { C._nodesInfo[d.type] = d; });
         renderPalette(defs);
+        // 节点定义到位后重绘一次（从历史恢复跳转过来时，类型中文名/已删除类型提示才准确）
+        if (nodes.length) { renderNodes(); renderInspector(); }
       });
 
       renderNodes();
       renderInspector();
+      loadImageOptions();
+      loadPipelineOptions();
+      // 首次挂载也可能带着历史恢复的自动加载请求
+      if (autoLoadId) {
+        const pid = autoLoadId;
+        autoLoadId = null;
+        loadPipelineById(pid);
+      }
     },
-    refresh() { loadImageOptions(); loadPipelineOptions(); },
+    refresh() {
+      loadImageOptions();
+      loadPipelineOptions();
+      // 历史页「恢复」后要求直接打开刚生成的流水线并定位问题
+      if (autoLoadId) {
+        const pid = autoLoadId;
+        autoLoadId = null;
+        loadPipelineById(pid);
+      }
+    },
+    /* 切到本视图并加载指定流水线（供历史恢复后跳转）。 */
+    openPipeline(pid) {
+      autoLoadId = pid;
+      window.App.show("pipeline");
+    },
   };
 })();

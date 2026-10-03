@@ -42,8 +42,16 @@ window.Views.batch = (function () {
         const pid = el.querySelector("#ba-pipeline").value;
         if (!selected.size) { C.toast("请选择图像", "error"); return; }
         if (!pid) { C.toast("请选择流水线", "error"); return; }
-        const r = await Api.post("/api/batch", { pipeline_id: pid, image_ids: Array.from(selected) });
-        C.toast("已入队，任务 " + r.job_id.slice(0, 8), "success");
+        const ps = await C.fetchPipelines();
+        const p = ps.find((x) => x.id === pid);
+        if (p && p.valid === false) {
+          C.toast("该流水线未通过当前规则校验（" + (p.errors || []).length + " 个错误），请先修复或改选其他流水线", "error");
+          return;
+        }
+        try {
+          const r = await Api.post("/api/batch", { pipeline_id: pid, image_ids: Array.from(selected) });
+          C.toast("已入队，任务 " + r.job_id.slice(0, 8), "success");
+        } catch (e) { C.toast(e.message, "error"); return; }
         loadJobs(el);
       };
     },
@@ -74,7 +82,11 @@ window.Views.batch = (function () {
   async function loadPipelines(el) {
     const ps = await C.fetchPipelines();
     el.querySelector("#ba-pipeline").innerHTML = `<option value="">— 选择流水线 —</option>` +
-      ps.map((p) => `<option value="${p.id}">${C.esc(p.name)}</option>`).join("");
+      ps.map((p) => {
+        const tag = p.valid === false ? "（不兼容，不可运行）"
+          : (p.warning_count ? "（" + p.warning_count + " 警告）" : "");
+        return `<option value="${p.id}" ${p.valid === false ? 'class="opt-invalid"' : ""}>${C.esc(p.name)}${tag}</option>`;
+      }).join("");
   }
 
   async function loadJobs(el) {
