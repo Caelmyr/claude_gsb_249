@@ -31,37 +31,55 @@ def _merge_params(node):
     return merged
 
 
-def validate(nodes):
-    """返回错误列表；空列表表示合法。"""
-    errors = []
+def validate_detailed(nodes):
+    """结构化校验：返回问题列表，每项都定位到具体节点/连线。
+
+    返回 [{kind, node_id, input, message}]；空列表表示合法。
+    kind 取值：missing_id / duplicate_id / unknown_type / input_count /
+               missing_input（连线问题，input 为被引用的源 id）/ cycle
+    供恢复历史快照、前端画布标注等场景使用——问题能精确标到节点和连线上，
+    而不是只有一句平铺的错误文本。
+    """
+    issues = []
     ids = set()
     for n in nodes:
         nid = n.get("id")
         if not nid:
-            errors.append("存在缺少 id 的节点")
+            issues.append({"kind": "missing_id", "node_id": None, "input": None,
+                           "message": "存在缺少 id 的节点"})
             continue
         if nid in ids:
-            errors.append(f"节点 id 重复：{nid}")
+            issues.append({"kind": "duplicate_id", "node_id": nid, "input": None,
+                           "message": f"节点 id 重复：{nid}"})
         ids.add(nid)
         spec = node_registry.get_node(n.get("type"))
         if spec is None:
-            errors.append(f"未知节点类型：{n.get('type')}")
+            issues.append({"kind": "unknown_type", "node_id": nid, "input": None,
+                           "message": f"未知节点类型：{n.get('type')}（节点 {nid}）"})
             continue
         ni = len(n.get("inputs") or [])
         if ni < spec["min_inputs"] or ni > spec["max_inputs"]:
-            errors.append(f"节点 {nid} 输入数量 {ni} 超出允许范围 "
-                          f"[{spec['min_inputs']}, {spec['max_inputs']}]")
+            issues.append({"kind": "input_count", "node_id": nid, "input": None,
+                           "message": f"节点 {nid} 输入数量 {ni} 超出允许范围 "
+                                      f"[{spec['min_inputs']}, {spec['max_inputs']}]"})
 
     for n in nodes:
         for inp in (n.get("inputs") or []):
             if inp not in ids:
-                errors.append(f"节点 {n.get('id')} 引用了不存在的输入 {inp}")
+                issues.append({"kind": "missing_input", "node_id": n.get("id"), "input": inp,
+                               "message": f"节点 {n.get('id')} 引用了不存在的输入 {inp}"})
 
-    if not errors:
+    if not issues:
         ordered, leftover = _topo(nodes)
-        if leftover:
-            errors.append("流水线存在环，无法执行")
-    return errors
+        for nid in leftover:
+            issues.append({"kind": "cycle", "node_id": nid, "input": None,
+                           "message": f"节点 {nid} 处于循环依赖中，流水线存在环，无法执行"})
+    return issues
+
+
+def validate(nodes):
+    """返回错误信息列表；空列表表示合法。"""
+    return [i["message"] for i in validate_detailed(nodes)]
 
 
 def _topo(nodes):

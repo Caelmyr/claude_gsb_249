@@ -74,7 +74,7 @@ window.Views.batch = (function () {
   async function loadPipelines(el) {
     const ps = await C.fetchPipelines();
     el.querySelector("#ba-pipeline").innerHTML = `<option value="">— 选择流水线 —</option>` +
-      ps.map((p) => `<option value="${p.id}">${C.esc(p.name)}</option>`).join("");
+      ps.map((p) => `<option value="${p.id}">${p.valid === false ? "⚠️ " : ""}${C.esc(p.name)}${p.valid === false ? "（校验未通过）" : ""}</option>`).join("");
   }
 
   async function loadJobs(el) {

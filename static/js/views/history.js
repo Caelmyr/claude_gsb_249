@@ -52,6 +52,11 @@ window.Views.history = (function () {
     if (current) renderDetail(el, current);
   }
 
+  function issueListHTML(issues) {
+    return `<ul class="issue-list">` +
+      issues.map((i) => `<li>${C.esc(i.message)}</li>`).join("") + `</ul>`;
+  }
+
   function renderDetail(el, e) {
     const box = el.querySelector("#hi-detail");
     const nodes = (e.pipeline_snapshot && e.pipeline_snapshot.nodes) || [];
@@ -66,15 +71,27 @@ window.Views.history = (function () {
         <div><span class="dim">版本快照</span> ${nodes.map((n) => `<span class="badge">${C.esc(n.type)}</span>`).join(" ") || "无节点"}</div>
         ${nodeResults.length ? `<div><span class="dim">节点执行</span> ${nodeResults.map((n) => `${n.ok ? "✓" : "✗"}${n.node_id}`).join(" ")}</div>` : ""}
       </div>
+      <div id="hi-snapshot-valid" style="margin-top:8px"></div>
       ${e.result_id ? `<img src="/api/results/${e.result_id}/file" style="width:100%;border-radius:8px;margin-top:10px">` : ""}
       <div class="toolbar" style="margin-top:12px">
         <button class="btn" id="hi-restore">恢复为流水线</button>
         <button class="btn btn-danger" id="hi-del">删除记录</button>
       </div>`;
+    checkSnapshot(box, nodes);
     box.querySelector("#hi-restore").onclick = async () => {
       const p = await Api.post(`/api/history/${e.id}/restore`);
-      C.toast("已恢复为流水线：" + p.name, "success");
       await C.refreshPipelines();
+      if (p.valid) {
+        C.toast("已恢复为流水线：" + p.name, "success");
+      } else {
+        C.toast(`已恢复为「${p.name}」，但有 ${p.validation.length} 处与当前规则不符，运行前需修复`, "error");
+        const m = C.modal(
+          `<div style="color:var(--text-faint);font-size:12px;margin-bottom:8px">该快照保存于旧版本，以下节点/连线不符合当前校验规则（已在流水线列表与编辑器中标出）：</div>
+           ${issueListHTML(p.validation)}
+           <div class="modal-actions"><button class="btn btn-primary" id="mi-ok">知道了</button></div>`,
+          "恢复的流水线存在问题");
+        m.el.querySelector("#mi-ok").onclick = m.close;
+      }
     };
     box.querySelector("#hi-del").onclick = async () => {
       if (!confirm("删除该历史记录（连同结果文件）？")) return;
@@ -83,5 +100,20 @@ window.Views.history = (function () {
       C.toast("已删除", "success");
       load(document.querySelector('.view[data-view="history"]'));
     };
+  }
+
+  /* 用当前校验规则预检快照，让用户在点「恢复」前就能看出旧快照是否还能跑。 */
+  async function checkSnapshot(box, nodes) {
+    const slot = box.querySelector("#hi-snapshot-valid");
+    if (!slot) return;
+    if (!nodes.length) { slot.innerHTML = ""; return; }
+    try {
+      const r = await Api.post("/api/pipelines/validate", { nodes });
+      slot.innerHTML = r.valid
+        ? `<span class="badge green">✓ 快照符合当前校验规则，恢复后可直接运行</span>`
+        : `<span class="badge red">✗ 快照有 ${r.issues.length} 处与当前规则不符</span>${issueListHTML(r.issues)}`;
+    } catch (err) {
+      slot.innerHTML = "";
+    }
   }
 })();

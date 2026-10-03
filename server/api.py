@@ -93,10 +93,14 @@ def _result_view(entry):
 
 
 def _pipeline_view(p):
+    # 有效性始终用「当前」校验规则现算：节点类型/连线规则随版本演进，
+    # 旧快照（尤其是历史恢复出来的）可能已不符合现行规则，必须在运行前可见。
+    issues = pipeline_engine.validate_detailed(p.get("nodes", []))
     return {
         "id": p["id"], "name": p["name"], "nodes": p["nodes"],
         "version": p.get("version", 1), "created_at": p.get("created_at"),
         "updated_at": p.get("updated_at"),
+        "valid": not issues, "validation": issues,
     }
 
 
@@ -265,7 +269,7 @@ def create_pipeline():
         doc[pid] = rec
         return doc
     pipelines_store.update(_upd)
-    return jsonify({**_pipeline_view(rec), "valid": rec["valid"], "errors": errors})
+    return jsonify({**_pipeline_view(rec), "errors": errors})
 
 
 @bp.get("/pipelines/<pid>")
@@ -304,7 +308,15 @@ def update_pipeline(pid):
     p = pipelines_store.read().get(pid)
     if not p:
         return jsonify({"error": "not found"}), 404
-    return jsonify({**_pipeline_view(p), "valid": not errors, "errors": errors})
+    return jsonify({**_pipeline_view(p), "errors": errors})
+
+
+@bp.post("/pipelines/validate")
+def validate_pipeline():
+    """用当前校验规则检查一组节点（不落库），供编辑器/历史页在运行前预检。"""
+    data = request.get_json(silent=True) or {}
+    issues = pipeline_engine.validate_detailed(data.get("nodes", []))
+    return jsonify({"valid": not issues, "issues": issues})
 
 
 @bp.delete("/pipelines/<pid>")
@@ -630,13 +642,19 @@ def restore_history(history_id):
         return jsonify({"error": "not found"}), 404
     pid = __import__("uuid").uuid4().hex
     e = history.get(history_id)
+    nodes = snapshot.get("nodes", [])
+    # 恢复时即用当前校验规则检查旧快照：历史是不同时期保存的，
+    # 节点类型/连线规则可能已变更，问题必须随流水线一起落库并返回，
+    # 而不是默认当成有效、等运行时才暴露。
+    issues = pipeline_engine.validate_detailed(nodes)
     rec = {
         "id": pid,
         "name": f"恢复自 {e.get('pipeline_name') or '历史'}",
-        "nodes": snapshot.get("nodes", []),
+        "nodes": nodes,
         "version": 1, "versions": [],
         "created_at": now_iso(), "updated_at": now_iso(),
-        "valid": True,
+        "valid": not issues,
+        "validation": issues,
     }
     pipelines_store.update(lambda doc: {**doc, pid: rec})
     return jsonify(_pipeline_view(rec))

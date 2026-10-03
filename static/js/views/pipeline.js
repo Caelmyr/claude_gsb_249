@@ -46,11 +46,12 @@ window.Views.pipeline = (function () {
     canvas.querySelectorAll(".node").forEach((n) => n.remove());
     nodeEls = {};
     nodes.forEach((n) => {
+      const def = (C._nodesInfo || {})[n.type];
       const el = C.h(`
-        <div class="node ${sel === n.id ? "selected" : ""}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
+        <div class="node ${sel === n.id ? "selected" : ""} ${def ? "" : "error"}" data-id="${n.id}" style="left:${n.x}px;top:${n.y}px">
           <div class="node-header"><span class="dot"></span>${C.esc(nodeLabel(n.type))}
             <span style="flex:1"></span><span class="node-x" title="删除">×</span></div>
-          <div class="node-body">${C.esc((C._nodesInfo[n.type] && C._nodesInfo[n.type].desc) || "")}</div>
+          <div class="node-body">${def ? C.esc(def.desc || "") : "未知类型，当前版本不支持"}</div>
           <div class="port in" data-id="${n.id}" data-port="in"></div>
           <div class="port out" data-id="${n.id}" data-port="out"></div>
         </div>`);
@@ -125,6 +126,7 @@ window.Views.pipeline = (function () {
         connecting = null;
         renderNodes();
         select(n.id);
+        validateSoon();
       }
     });
   }
@@ -141,6 +143,7 @@ window.Views.pipeline = (function () {
     if (sel === id) sel = null;
     renderNodes();
     renderInspector();
+    validateSoon();
   }
 
   function addNode(type, x, y) {
@@ -150,6 +153,7 @@ window.Views.pipeline = (function () {
     renderNodes();
     const last = nodes[nodes.length - 1];
     select(last.id);
+    validateSoon();
   }
 
   // ------------------------------------------------------------------ 检查器
@@ -157,24 +161,40 @@ window.Views.pipeline = (function () {
     const node = nodes.find((n) => n.id === sel);
     let paramHTML = `<div class="empty">未选择节点<br><span style="font-size:12px">从左侧拖入节点，或点击已有节点编辑参数</span></div>`;
     if (node) {
-      const def = C._nodesInfo[node.type];
-      const form = C.schemaForm(def.schema, node.params);
-      paramHTML = `
-        <div class="panel-title">${C.esc(nodeLabel(node.type))} <span class="dim">#${node.id}</span></div>
-        <div class="param-grid">${form.html}</div>
-        <div class="toolbar" style="margin-top:10px">
-          <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
-          <button class="btn btn-sm" id="insp-clear">清空全部</button>
-        </div>`;
-      // 延迟绑定表单
-      setTimeout(() => {
-        const box = inspectorEl.querySelector(".param-grid");
-        if (box) {
-          form.bind(box, (vals) => { node.params = vals; });
-        }
-        inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
-        inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); };
-      }, 0);
+      const def = (C._nodesInfo || {})[node.type];
+      if (!def) {
+        // 旧快照恢复出来的节点类型可能已被移除/改名：明确标出，而不是让面板崩溃
+        paramHTML = `
+          <div class="panel-title">${C.esc(nodeLabel(node.type))} <span class="dim">#${node.id}</span></div>
+          <div class="empty" style="padding:16px 8px">未知节点类型「${C.esc(node.type)}」<br>
+            <span style="font-size:12px">当前版本不支持该类型，流水线无法通过校验。<br>请删除此节点，或用有效节点替代。</span></div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
+            <button class="btn btn-sm" id="insp-clear">清空全部</button>
+          </div>`;
+        setTimeout(() => {
+          inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
+          inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); validateSoon(); };
+        }, 0);
+      } else {
+        const form = C.schemaForm(def.schema, node.params);
+        paramHTML = `
+          <div class="panel-title">${C.esc(nodeLabel(node.type))} <span class="dim">#${node.id}</span></div>
+          <div class="param-grid">${form.html}</div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn btn-sm btn-danger" id="insp-del">删除节点</button>
+            <button class="btn btn-sm" id="insp-clear">清空全部</button>
+          </div>`;
+        // 延迟绑定表单
+        setTimeout(() => {
+          const box = inspectorEl.querySelector(".param-grid");
+          if (box) {
+            form.bind(box, (vals) => { node.params = vals; });
+          }
+          inspectorEl.querySelector("#insp-del").onclick = () => deleteNode(node.id);
+          inspectorEl.querySelector("#insp-clear").onclick = () => { nodes = []; sel = null; renderNodes(); renderInspector(); validateSoon(); };
+        }, 0);
+      }
     }
     inspectorEl.querySelector("#insp-node").innerHTML = paramHTML;
     renderRunSection();
@@ -189,18 +209,46 @@ window.Views.pipeline = (function () {
         <div class="toolbar">
           <button class="btn btn-primary" id="insp-run">▶ 运行流水线</button>
           <button class="btn" id="insp-save">保存</button>
+          <button class="btn" id="insp-validate">校验</button>
         </div>
+        <div id="insp-valid"></div>
         <div class="field"><label>加载已保存流水线</label>
           <div class="select-row"><select id="insp-load"></select><button class="btn btn-sm" id="insp-load-btn">加载</button></div>
         </div>
         <div id="insp-preview" class="stage" style="margin-top:10px;min-height:120px"><span class="dim">运行后在此显示结果</span></div>`);
       inspectorEl.querySelector("#insp-run").onclick = runPipeline;
       inspectorEl.querySelector("#insp-save").onclick = savePipeline;
+      inspectorEl.querySelector("#insp-validate").onclick = () => validateCanvas();
       inspectorEl.querySelector("#insp-load-btn").onclick = loadPipeline;
       loadImageOptions();
       loadPipelineOptions();
     }
   }
+
+  /* 用当前校验规则检查画布，把问题标到具体节点上并给出状态行。
+     返回 {valid, issues}；运行前调用可避免白跑一次。 */
+  async function validateCanvas() {
+    const box = inspectorEl.querySelector("#insp-valid");
+    Object.values(nodeEls).forEach((el) => el.classList.remove("error"));
+    // 未知类型节点始终保持标红（即使校验接口尚未返回）
+    nodes.forEach((n) => { if (!(C._nodesInfo || {})[n.type] && nodeEls[n.id]) nodeEls[n.id].classList.add("error"); });
+    if (!nodes.length) { if (box) box.innerHTML = ""; return { valid: false, issues: [] }; }
+    let r;
+    try {
+      r = await Api.post("/api/pipelines/validate", { nodes: nodes.map(strip) });
+    } catch (e) {
+      return { valid: true, issues: [] };   // 校验接口不可用时不阻塞编辑
+    }
+    if (box) {
+      box.innerHTML = r.valid
+        ? `<div class="valid-line ok">✓ 校验通过，可以运行</div>`
+        : `<div class="valid-line bad">✗ ${r.issues.length} 处问题，运行将失败：</div>
+           <ul class="issue-list">${r.issues.map((i) => `<li>${C.esc(i.message)}</li>`).join("")}</ul>`;
+    }
+    r.issues.forEach((i) => { if (i.node_id && nodeEls[i.node_id]) nodeEls[i.node_id].classList.add("error"); });
+    return r;
+  }
+  const validateSoon = C.debounce(() => validateCanvas(), 400);
 
   async function loadImageOptions() {
     const sel = inspectorEl.querySelector("#insp-image");
@@ -213,13 +261,19 @@ window.Views.pipeline = (function () {
     const sel = inspectorEl.querySelector("#insp-load");
     const ps = await C.fetchPipelines();
     sel.innerHTML = `<option value="">— 选择流水线 —</option>` +
-      ps.map((p) => `<option value="${p.id}">${C.esc(p.name)}</option>`).join("");
+      ps.map((p) => `<option value="${p.id}">${p.valid === false ? "⚠️ " : ""}${C.esc(p.name)}</option>`).join("");
   }
 
   async function runPipeline() {
     const imageId = inspectorEl.querySelector("#insp-image").value;
     if (!imageId) { C.toast("请先选择输入图像", "error"); return; }
     if (!nodes.length) { C.toast("流水线为空，请先添加节点", "error"); return; }
+    // 运行前先过一遍当前校验规则：有问题直接标出并阻止，不白跑一次运行
+    const v = await validateCanvas();
+    if (!v.valid) {
+      C.toast(`校验未通过（${v.issues.length} 处问题），请先修复标红的节点/连线`, "error");
+      return;
+    }
     const preview = inspectorEl.querySelector("#insp-preview");
     preview.innerHTML = `<div class="loading">运行中…</div>`;
     try {
@@ -265,14 +319,22 @@ window.Views.pipeline = (function () {
       id: newId(), type: n.type, params: n.params, inputs: n.inputs,
       x: n.x != null ? n.x : 20 + (i % 4) * 220, y: n.y != null ? n.y : 20 + Math.floor(i / 4) * 130,
     }));
-    // 修正 inputs 引用（用映射表）
+    // 修正 inputs 引用（用映射表）；指向已不存在节点的连线会被移除并计数提示
     const map = {};
     p.nodes.forEach((n, i) => { map[n.id] = nodes[i].id; });
-    nodes.forEach((n) => { n.inputs = (n.inputs || []).map((s) => map[s]).filter(Boolean); });
+    let dropped = 0;
+    nodes.forEach((n) => {
+      const mapped = (n.inputs || []).map((s) => map[s]);
+      dropped += mapped.filter((s) => !s).length;
+      n.inputs = mapped.filter(Boolean);
+    });
     sel = null;
     renderNodes();
     renderInspector();
-    C.toast("已加载流水线", "success");
+    if (dropped) C.toast(`有 ${dropped} 条连线指向已不存在的节点，加载时已移除`, "error");
+    const v = await validateCanvas();
+    if (v.valid) C.toast("已加载流水线", "success");
+    else C.toast(`已加载流水线，但存在 ${v.issues.length} 处问题（见下方校验结果）`, "error");
   }
 
   // ------------------------------------------------------------------ 挂载
